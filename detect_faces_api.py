@@ -8,6 +8,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 import time
 import base64
+import dlib  # Add DLib for secondary face detection
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
@@ -25,32 +26,44 @@ app.add_middleware(
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=True,
-    max_num_faces=2,  # Further reduced to limit false positives
+    max_num_faces=2,  # Keep limited to reduce false positives
     refine_landmarks=True,
-    min_detection_confidence=0.7,  # Stricter threshold
-    min_tracking_confidence=0.7
+    min_detection_confidence=0.6,  # Slightly increased to reduce false positives
+    min_tracking_confidence=0.6
 )
 
 # Load Haar Cascade for secondary face detection
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
+# Initialize DLib face detector
+dlib_detector = dlib.get_frontal_face_detector()
+
 def validate_face_with_haar(image, x_min, y_min, x_max, y_max):
-    """Validate the face region using Haar Cascade face detector."""
+    """Validate the face region using Haar Cascade face detector with stricter parameters."""
     face_region = image[y_min:y_max, x_min:x_max]
     if face_region.size == 0:
         return False
 
     gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=10, minSize=(50, 50), maxSize=(200, 200))
+    return len(faces) > 0
+
+def validate_face_with_dlib(image, x_min, y_min, x_max, y_max):
+    """Validate the face region using DLib face detector."""
+    face_region = image[y_min:y_max, x_min:x_max]
+    if face_region.size == 0:
+        return False
+
+    gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
+    faces = dlib_detector(gray, 1)
     return len(faces) > 0
 
 def validate_face_geometry(image, landmarks, x_min, y_min, x_max, y_max):
-    """Validate face geometry using landmark distribution."""
+    """Validate face geometry using landmark distribution with stricter checks."""
     if len(landmarks) < 468:  # Mediapipe Face Mesh should return 468 landmarks
         return False
 
     # Check key facial landmarks (eyes, nose, mouth)
-    # Approximate indices for key landmarks (Mediapipe Face Mesh)
     left_eye = landmarks[33]   # Left eye outer corner
     right_eye = landmarks[263] # Right eye outer corner
     nose_tip = landmarks[1]    # Nose tip
@@ -63,7 +76,7 @@ def validate_face_geometry(image, landmarks, x_min, y_min, x_max, y_max):
     # Check horizontal alignment (eyes should be roughly symmetric)
     eye_distance = abs(left_eye[0] - right_eye[0])
     face_width = x_max - x_min
-    if eye_distance < 0.2 * face_width or eye_distance > 0.6 * face_width:
+    if eye_distance < 0.3 * face_width or eye_distance > 0.7 * face_width:
         return False
 
     # Check face region using contour analysis
@@ -82,9 +95,9 @@ def validate_face_geometry(image, landmarks, x_min, y_min, x_max, y_max):
     x, y, w, h = cv2.boundingRect(largest_contour)
     aspect_ratio = w / h if h > 0 else 0
 
-    min_area = 1500  # Stricter minimum area
-    min_aspect_ratio = 0.6  # Slightly stricter
-    max_aspect_ratio = 1.8  # Slightly stricter
+    min_area = 2000  # Stricter minimum area
+    min_aspect_ratio = 0.7  # Stricter aspect ratio
+    max_aspect_ratio = 1.7  # Stricter aspect ratio
 
     if contour_area < min_area:
         return False
@@ -93,29 +106,20 @@ def validate_face_geometry(image, landmarks, x_min, y_min, x_max, y_max):
 
     return True
 
-def validate_skin_tone(image, x_min, y_min, x_max, y_max):
-    """Validate the face region for consistent skin tone."""
-    face_region = image[y_min:y_max, x_min:x_max]
-    if face_region.size == 0:
+def validate_face_region(image, x_min, y_min, x_max, y_max):
+    """Validate the face region with additional checks."""
+    # Check region size
+    face_width = x_max - x_min
+    face_height = y_max - y_min
+    if face_width < 50 or face_height < 50 or face_width > 300 or face_height > 300:
         return False
 
-    # Convert to HSV for skin tone analysis
-    hsv = cv2.cvtColor(face_region, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
+    # Check region aspect ratio
+    aspect_ratio = face_width / face_height if face_height > 0 else 0
+    if aspect_ratio < 0.7 or aspect_ratio > 1.7:
+        return False
 
-    # Typical skin tone range in HSV (approximate)
-    # Hue: 0-30 (skin tones typically fall in this range)
-    # Saturation: 20-200 (avoid very low or very high saturation)
-    # Value: 40-255 (avoid very dark regions)
-    skin_mask = cv2.inRange(hsv, np.array([0, 20, 40]), np.array([30, 200, 255]))
-    
-    # Calculate the percentage of skin-like pixels
-    skin_pixels = cv2.countNonZero(skin_mask)
-    total_pixels = face_region.shape[0] * face_region.shape[1]
-    skin_ratio = skin_pixels / total_pixels if total_pixels > 0 else 0
-
-    # Require at least 50% of the region to have skin-like color
-    return skin_ratio > 0.5
+    return True
 
 def extract_faces(image):
     """Extracts all faces from the image with enhanced validation to reduce false positives."""
@@ -143,20 +147,25 @@ def extract_faces(image):
         y_min = max(0, y_min - padding)
         y_max = min(image.shape[0], y_max + padding)
 
+        # Validate the face region
+        if not validate_face_region(image, x_min, y_min, x_max, y_max):
+            logging.warning(f"Face at index {face_idx} failed region validation")
+            continue
+
         # Validate the face using multiple checks
         # 1. Haar Cascade validation
         if not validate_face_with_haar(image, x_min, y_min, x_max, y_max):
             logging.warning(f"Face at index {face_idx} failed Haar Cascade validation")
             continue
 
-        # 2. Geometry validation (landmark distribution, contour analysis)
-        if not validate_face_geometry(image, landmarks, x_min, y_min, x_max, y_max):
-            logging.warning(f"Face at index {face_idx} failed geometry validation")
+        # 2. DLib validation
+        if not validate_face_with_dlib(image, x_min, y_min, x_max, y_max):
+            logging.warning(f"Face at index {face_idx} failed DLib validation")
             continue
 
-        # 3. Skin tone validation
-        if not validate_skin_tone(image, x_min, y_min, x_max, y_max):
-            logging.warning(f"Face at index {face_idx} failed skin tone validation")
+        # 3. Geometry validation
+        if not validate_face_geometry(image, landmarks, x_min, y_min, x_max, y_max):
+            logging.warning(f"Face at index {face_idx} failed geometry validation")
             continue
 
         # Extract the face
