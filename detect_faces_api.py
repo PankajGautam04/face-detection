@@ -25,7 +25,7 @@ face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=True,
     max_num_faces=5,  # Increased to detect multiple faces
     refine_landmarks=True,
-    min_detection_confidence=0.1,  # Lowered to improve detection
+    min_detection_confidence=0.7,  # Lowered to improve detection
     min_tracking_confidence=0.1
 )
 
